@@ -15,6 +15,7 @@ over and over.
 - **Phase 1** – Start a new feature branch from `main`/`master` in a safe, clean state.
 - **Phase 2** – Stage, commit, push, and automatically open the new merge request URL in your browser.
 - **Phase 3** – Amend the last commit (reusing its message) and force‑push with lease.
+- **Phase 4** – Switch to the master/main branch and pull the latest changes.
 - Automatic detection of the default branch (`main` or `master`).
 - Rich coloured output (8‑bit terminal colours) – disabled automatically when output is redirected.
 - Comprehensive error logging to `/tmp/gitlord.log` with size‑based rotation and compression.
@@ -77,6 +78,13 @@ gitlord push "<commit message>" [--branch <branch>]
 
 If --branch is omitted, the current branch is used.
 
+- Optionally, use `--user` to specify the git user name for the commit message. If not provided, the git user name is read from your local Git configuration.
+
+Example:
+```bash
+gitlord push "Add new VPC module with subnet outputs" --user "Alice"
+```
+
 Example:
 ```bash
 gitlord push "Add new VPC module with subnet outputs"
@@ -91,6 +99,20 @@ gitlord amend [--branch <branch>]
 - Stages all changes.
 - Amends the previous commit without changing its message (--no-edit).
 - Force‑pushes with --force-with-lease to avoid overwriting remote work accidentally.
+
+### 4. Switch to master/main branch and pull latest (Phase 4)
+```bash
+gitlord done
+```
+- Detects the default branch (master or main).
+- Checks out the default branch.
+- Pulls the latest changes from origin.
+
+Example:
+```bash
+gitlord done
+```
+This is useful after completing feature work to sync your local repository with the latest main/master branch.
 
 Example:
 ```bash
