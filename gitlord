@@ -249,7 +249,7 @@ def phase1_start(branch_name: str, base_branch: Optional[str] = None) -> None:  
         raise RuntimeError(f"Branch switch failed. Expected '{branch_name}', got '{current}'.")
     print_success(f"Now on branch '{branch_name}' – ready to work.")
 
-def phase2_push(commit_message: str, branch_name: Optional[str] = None) -> None:   # <-- Optional
+def phase2_push(commit_message: str, user_name: str, branch_name: Optional[str] = None) -> None:   # <-- Optional
     """
     PHASE 2 – Stage, commit, push, and open the merge request URL.
     Steps:
@@ -273,8 +273,12 @@ def phase2_push(commit_message: str, branch_name: Optional[str] = None) -> None:
     # 2. Stage all files
     run_git(["add", "."])
 
-    # 3. Commit
+    # 3. Append branch and user to commit message
+    commit_message = f"{commit_message}\n\n{branch_name} for user {user_name}"
+
+    # 4. Commit
     run_git(["commit", "-m", commit_message])
+    
 
     # 4. Push and capture combined output
     push_cmd = ["push", "origin", branch_name]
@@ -324,6 +328,38 @@ def phase3_amend(branch_name: Optional[str] = None) -> None:   # <-- Optional
     print_success("Amend pushed successfully. The existing merge request is updated.")
 
 # ----------------------------------------------------------------------
+# Phase 4 – Switch to main/master and pull
+# ----------------------------------------------------------------------
+def phase4_done() -> None:
+    """
+    PHASE 4 – Switch to the master/main branch and pull latest changes.
+    Steps:
+      1. Detect the default branch (master or main).
+      2. Checkout the default branch.
+      3. Pull the latest changes.
+    """
+    print_phase_header(4, "Switch to master/main and pull latest")
+
+    # Detect default branch
+    base_branch = detect_default_branch()
+    print_info(f"Detected default branch: {base_branch}")
+
+    # Checkout base branch
+    proc = run_git(["checkout", base_branch], check=False)
+    if proc.returncode != 0:
+        print_info(f"Local branch '{base_branch}' not found – creating from origin/{base_branch}")
+        run_git(["checkout", "-b", base_branch, f"origin/{base_branch}"])
+
+    # Pull latest changes
+    run_git(["pull", "origin", base_branch])
+
+    # Verify branch switched
+    current = get_current_branch()
+    if current != base_branch:
+        raise RuntimeError(f"Branch switch failed. Expected '{base_branch}', got '{current}'.")
+    print_success(f"Now on branch '{base_branch}' with latest changes pulled.")
+
+# ----------------------------------------------------------------------
 # CLI parsing
 # ----------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
@@ -347,12 +383,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p2 = subparsers.add_parser("push", help="PHASE 2 – stage, commit, push and open MR")
     p2.add_argument("commit_message", nargs="+", help="Commit message (quote if it contains spaces)")
     p2.add_argument("--branch", default=None, help="Branch to push (default: current branch)")
+    p2.add_argument("--user", default=None, help="Git user name (optional)")
 
     # Phase 3: amend (no commit_message argument)
     p3 = subparsers.add_parser("amend", help="PHASE 3 – amend last commit (reuse message) and force-push")
     p3.add_argument("--branch", default=None, help="Branch to amend (default: current branch)")
 
     return parser
+
 
 # ----------------------------------------------------------------------
 # Main entry point
@@ -366,7 +404,12 @@ def main() -> None:
             phase1_start(args.branch_name, args.base)
         elif args.command == "push":
             msg = " ".join(args.commit_message)
-            phase2_push(msg, args.branch)
+            # Determine username if not passed
+            user_proc = run_git(["config", "user.name"], check=False)
+            user_name = user_proc.stdout.strip() if user_proc.returncode == 0 else "unknown"
+            if hasattr(args, "user") and args.user:
+                user_name = args.user
+            phase2_push(msg, user_name, args.branch)
         elif args.command == "amend":
             # No commit message needed – reuses previous
             phase3_amend(args.branch)
