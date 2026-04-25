@@ -345,10 +345,10 @@ def phase4_done() -> None:
     print_info(f"Detected default branch: {base_branch}")
 
     # Checkout base branch
-    proc = run_git(["checkout", base_branch], check=False)
+    proc = run_git(["switch", base_branch], check=False)
     if proc.returncode != 0:
         print_info(f"Local branch '{base_branch}' not found – creating from origin/{base_branch}")
-        run_git(["checkout", "-b", base_branch, f"origin/{base_branch}"])
+        run_git(["checkout", base_branch, f"origin/{base_branch}"])
 
     # Pull latest changes
     run_git(["pull", "origin", base_branch])
@@ -389,6 +389,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p3 = subparsers.add_parser("amend", help="PHASE 3 – amend last commit (reuse message) and force-push")
     p3.add_argument("--branch", default=None, help="Branch to amend (default: current branch)")
 
+    # Phase 3: amend (no commit_message argument)
+    p4 = subparsers.add_parser("done", help="PHASE 4 – checkout the master/main branch and pull origin")
+    
     return parser
 
 
@@ -413,6 +416,9 @@ def main() -> None:
         elif args.command == "amend":
             # No commit message needed – reuses previous
             phase3_amend(args.branch)
+        elif args.command == "done":
+            # Checkout the master/main branch and pull origin
+            phase4_done()
     except Exception as exc:
         error_msg = str(exc)
         print_error(error_msg)
