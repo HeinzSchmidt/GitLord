@@ -43,7 +43,9 @@ over and over.
    (If you don’t have /usr/local/bin, you can also place it in ~/bin and add that to your PATH.)
 3. Verify installation:
    ```bash
-
+   gitlord --help
+   ```
+   
 ## Usage
 
 ### 1. Start a new feature branch (Phase 1)
