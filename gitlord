@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""
+gitlord – Automate a typical GitLab CICD workflow.
+
+Phases:
+  gitlord start <branch> [--base <main|master>]
+  gitlord push  "<commit message>"
+  gitlord amend [--branch <name>]       # reuses last commit message
+
+Error logging is written to /tmp/gitlord.log (rotated at 20 MiB).
+Coloured output uses 8‑bit terminal codes when running inside a TTY.
+"""
+
+import argparse
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+import webbrowser
+import zipfile
+from datetime import datetime
+from typing import Optional   # <-- for backward compatibility
+
+# ----------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------
+LOG_PATH = "/tmp/gitlord.log"
+LOG_ZIP_PATH = "/tmp/gitlord.log.zip"
+MAX_LOG_BYTES = 20 * 1024 * 1024  # 20 MiB
+
+# 8-bit colour codes (256-colour palette)
+COLOR_PHASE1 = 82   # bright green
+COLOR_PHASE2 = 33   # blue
+COLOR_PHASE3 = 220  # gold
+COLOR_ERROR  = 196  # red
+COLOR_SUCCESS = 46  # green
+COLOR_INFO    = 252 # light grey
+COLOR_RESET   = "\033[0m"
+
+# ----------------------------------------------------------------------
+# Logging with size‑based rotation and compression
+# ----------------------------------------------------------------------
+def _ensure_log_directory() -> None:
+    """Make sure /tmp is writable (almost always true)."""
+    if not os.access("/tmp", os.W_OK):
+        sys.exit("ERROR: Cannot write to /tmp – logging impossible.")
+
+def _rotate_log_if_needed() -> None:
+    """
+    If /tmp/gitlord.log exceeds 20 MiB, compress it to a zip file,
+    delete any existing zip, and start a fresh log file.
+    """
+    if not os.path.exists(LOG_PATH):
+        return
+    if os.path.getsize(LOG_PATH) < MAX_LOG_BYTES:
+        return
+
+    # Remove old zip if it exists
+    if os.path.exists(LOG_ZIP_PATH):
+        os.remove(LOG_ZIP_PATH)
+
+    # Compress the current log into a zip, with the original name inside the archive
+    with zipfile.ZipFile(LOG_ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(LOG_PATH, arcname=os.path.basename(LOG_PATH))
+
+    # Truncate / create a new empty log file
+    open(LOG_PATH, "w").close()
+    write_log("INFO", "Log rotated – previous log compressed to /tmp/gitlord.log.zip")
+
+def write_log(level: str, message: str) -> None:
+    """
+    Append a timestamped line to the error log.
+    Automatically checks log size and rotates if needed.
+    """
+    _ensure_log_directory()
+    _rotate_log_if_needed()
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    line = f"{timestamp} [{level}] {message}\n"
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(line)
+    except OSError as exc:
+        # Last resort: print to stderr (do not use colours here to avoid loops)
+        sys.stderr.write(f"LOGGING FAILED: {exc}\n")
+
+# ----------------------------------------------------------------------
+# Terminal colour helpers (8‑bit)
+# ----------------------------------------------------------------------
+def _is_tty() -> bool:
+    """Return True if stdout is a terminal (for coloured output)."""
+    return sys.stdout.isatty()
+
+def coloured(text: str, fg_colour: int, bold: bool = False) -> str:
+    """
+    Wrap `text` in ANSI escape sequences for an 8‑bit foreground colour.
+    If stdout is not a terminal, return plain text.
+    """
+    if not _is_tty():
+        return text
+    bold_seq = "\033[1m" if bold else ""
+    return f"{bold_seq}\033[38;5;{fg_colour}m{text}{COLOR_RESET}"
+
+def print_phase_header(phase: int, message: str) -> None:
+    """Print a coloured header for a given phase."""
+    colour_map = {1: COLOR_PHASE1, 2: COLOR_PHASE2, 3: COLOR_PHASE3}
+    colour = colour_map.get(phase, COLOR_INFO)
+    print(coloured(f"\n=== PHASE {phase}: {message} ===", colour, bold=True))
+
+def print_error(msg: str) -> None:
+    """Print an error message in red."""
+    print(coloured(f"ERROR: {msg}", COLOR_ERROR), file=sys.stderr)
+
+def print_success(msg: str) -> None:
+    """Print a success message in green."""
+    print(coloured(msg, COLOR_SUCCESS))
+
+def print_info(msg: str) -> None:
+    """Print an informational message in light grey."""
+    print(coloured(msg, COLOR_INFO))
+
+# ----------------------------------------------------------------------
+# Git helpers
+# ----------------------------------------------------------------------
+def run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    """
+    Execute a git command in the current working directory.
+    Returns the CompletedProcess with stdout and stderr captured as text.
+    On failure (if check is True) a RuntimeError is raised.
+    All calls are logged.
+    """
+    cmd = ["git"] + args
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("Git is not installed or not found in PATH.")
+
+    log_msg = f"RUN: {' '.join(cmd)}"
+    if proc.returncode != 0:
+        log_msg += f" | RC={proc.returncode} | STDERR: {proc.stderr.strip()}"
+    write_log("DEBUG" if proc.returncode == 0 else "ERROR", log_msg)
+
+    if check and proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"Git command failed with code {proc.returncode}")
+
+    return proc
+
+def get_current_branch() -> str:
+    """Return the name of the currently checked-out branch."""
+    proc = run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    branch = proc.stdout.strip()
+    if branch == "HEAD":
+        raise RuntimeError("Detached HEAD – no branch is currently checked out.")
+    return branch
+
+def detect_default_branch() -> str:
+    """
+    Try to determine the default remote branch (main or master).
+    Checks origin/HEAD first, then falls back to master/main existence.
+    """
+    # Try origin/HEAD symbolic ref
+    proc = run_git(["symbolic-ref", "refs/remotes/origin/HEAD"], check=False)
+    if proc.returncode == 0:
+        ref = proc.stdout.strip()
+        # ref looks like refs/remotes/origin/main
+        return ref.split("/")[-1]
+
+    # Fallback: check if origin/main or origin/master exists
+    for candidate in ("main", "master"):
+        check_proc = run_git(["show-ref", "--verify", f"refs/remotes/origin/{candidate}"], check=False)
+        if check_proc.returncode == 0:
+            return candidate
+
+    raise RuntimeError("Cannot detect default branch (origin/main or origin/master). Use --base.")
+
+def is_working_tree_clean() -> bool:
+    """Return True if there are no uncommitted changes."""
+    proc = run_git(["status", "--porcelain"])
+    return proc.stdout.strip() == ""
+
+def extract_merge_request_url(push_output: str) -> Optional[str]:   # <-- Optional
+    """
+    Try to find a GitLab merge request creation URL inside the git push output.
+    Returns the URL as a string, or None if not found.
+    """
+    # GitLab remote message: "remote: To create a merge request for ..., visit:\nremote:   <url>"
+    match = re.search(r"(https?://\S*merge_requests/new\S*)", push_output)
+    if match:
+        return match.group(1)
+    # Sometimes the URL appears without the "remote:" prefix (just in the combined stream)
+    for line in push_output.splitlines():
+        if "merge_requests/new" in line:
+            # Extract URL with a broader pattern
+            m = re.search(r"(https?://[^\s]+)", line)
+            if m:
+                return m.group(1)
+    return None
+
+# ----------------------------------------------------------------------
+# Phase functions
+# ----------------------------------------------------------------------
+def phase1_start(branch_name: str, base_branch: Optional[str] = None) -> None:   # <-- Optional
+    """
+    PHASE 1 – Prepare a new feature branch.
+    Steps:
+      1. Ensure the working tree is clean.
+      2. Fetch the latest remote references.
+      3. Switch to (and update) the base branch (master/main).
+      4. Create a new branch `branch_name` and activate it.
+      5. Verify the active branch.
+    """
+    print_phase_header(1, "Starting a new feature branch")
+
+    # 1. Clean working tree
+    if not is_working_tree_clean():
+        raise RuntimeError("Working tree is dirty. Please commit or stash changes before starting a new branch.")
+
+    # 2. Fetch remote (to get current state of base branch)
+    print_info("Fetching origin …")
+    run_git(["fetch", "origin"])
+
+    # Determine base branch if not provided
+    if not base_branch:
+        base_branch = detect_default_branch()
+        print_info(f"Detected default branch: {base_branch}")
+
+    # 3. Switch to base branch and pull
+    # Try to checkout locally; if that fails, create a tracking branch from origin
+    proc = run_git(["checkout", base_branch], check=False)
+    if proc.returncode != 0:
+        print_info(f"Local branch '{base_branch}' not found – creating from origin/{base_branch}")
+        run_git(["checkout", "-b", base_branch, f"origin/{base_branch}"])
+    # Fast-forward pull to avoid merge commits
+    run_git(["pull", "--ff-only", "origin", base_branch])
+
+    # 4. Create the new branch
+    run_git(["checkout", "-b", branch_name])
+
+    # 5. Verify
+    run_git(["branch", "--list", branch_name])  # no error; just prints
+    current = get_current_branch()
+    if current != branch_name:
+        raise RuntimeError(f"Branch switch failed. Expected '{branch_name}', got '{current}'.")
+    print_success(f"Now on branch '{branch_name}' – ready to work.")
+
+def phase2_push(commit_message: str, branch_name: Optional[str] = None) -> None:   # <-- Optional
+    """
+    PHASE 2 – Stage, commit, push, and open the merge request URL.
+    Steps:
+      1. Determine branch (current if not given).
+      2. Stage all changes (`git add .`).
+      3. Create a commit.
+      4. Push to origin and extract the merge request URL.
+      5. Open the URL in the default web browser.
+    """
+    print_phase_header(2, "Commit and push")
+
+    if not branch_name:
+        branch_name = get_current_branch()
+        print_info(f"Using current branch: {branch_name}")
+
+    # 1. Check for changes
+    proc = run_git(["status", "--porcelain"])
+    if not proc.stdout.strip():
+        raise RuntimeError("No changes to commit. Working tree is clean.")
+
+    # 2. Stage all files
+    run_git(["add", "."])
+
+    # 3. Commit
+    run_git(["commit", "-m", commit_message])
+
+    # 4. Push and capture combined output
+    push_cmd = ["push", "origin", branch_name]
+    proc = run_git(push_cmd, check=True)
+    # The push output is in proc.stderr (git sends info to stderr), but we might want combined.
+    combined_output = proc.stdout + proc.stderr
+
+    # Find merge request URL
+    mr_url = extract_merge_request_url(combined_output)
+    if mr_url:
+        print_success(f"Merge request URL: {mr_url}")
+        webbrowser.open(mr_url)
+    else:
+        print_info("Merge request URL not found in push output (maybe the branch already has one).")
+
+    print_success("Push completed successfully.")
+
+def phase3_amend(branch_name: Optional[str] = None) -> None:   # <-- Optional
+    """
+    PHASE 3 – Amend the last commit (reusing the previous message) and force‑with‑lease push.
+    Steps:
+      1. Determine branch (current if not given).
+      2. Stage all new changes.
+      3. Amend the last commit without editing the message (`--no-edit`).
+      4. Force‑push (with lease) to the same branch.
+    """
+    print_phase_header(3, "Amend and force-push (reusing last commit message)")
+
+    if not branch_name:
+        branch_name = get_current_branch()
+        print_info(f"Using current branch: {branch_name}")
+
+    # 1. Check for changes
+    proc = run_git(["status", "--porcelain"])
+    if not proc.stdout.strip():
+        raise RuntimeError("No changes to amend. Working tree is clean.")
+
+    # 2. Stage all files
+    run_git(["add", "."])
+
+    # 3. Amend commit (keep the previous message)
+    run_git(["commit", "--amend", "--no-edit"])
+
+    # 4. Force-push with lease
+    run_git(["push", "origin", branch_name, "--force-with-lease"])
+
+    print_success("Amend pushed successfully. The existing merge request is updated.")
+
+# ----------------------------------------------------------------------
+# CLI parsing
+# ----------------------------------------------------------------------
+def build_argparser() -> argparse.ArgumentParser:
+    """Create the argument parser for the three sub‑commands."""
+    parser = argparse.ArgumentParser(
+        description="gitlord – automate your GitLab CICD workflow",
+        epilog="See gitlord <command> --help for details.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Phase 1: start
+    p1 = subparsers.add_parser("start", help="PHASE 1 – create a new feature branch")
+    p1.add_argument("branch_name", help="Name of the new branch to create")
+    p1.add_argument(
+        "--base",
+        default=None,
+        help="Base branch (main or master). If omitted, auto‑detect from remote.",
+    )
+
+    # Phase 2: push
+    p2 = subparsers.add_parser("push", help="PHASE 2 – stage, commit, push and open MR")
+    p2.add_argument("commit_message", nargs="+", help="Commit message (quote if it contains spaces)")
+    p2.add_argument("--branch", default=None, help="Branch to push (default: current branch)")
+
+    # Phase 3: amend (no commit_message argument)
+    p3 = subparsers.add_parser("amend", help="PHASE 3 – amend last commit (reuse message) and force-push")
+    p3.add_argument("--branch", default=None, help="Branch to amend (default: current branch)")
+
+    return parser
+
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
+def main() -> None:
+    parser = build_argparser()
+    args = parser.parse_args()
+
+    try:
+        if args.command == "start":
+            phase1_start(args.branch_name, args.base)
+        elif args.command == "push":
+            msg = " ".join(args.commit_message)
+            phase2_push(msg, args.branch)
+        elif args.command == "amend":
+            # No commit message needed – reuses previous
+            phase3_amend(args.branch)
+    except Exception as exc:
+        error_msg = str(exc)
+        print_error(error_msg)
+        write_log("ERROR", error_msg)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
